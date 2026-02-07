@@ -262,130 +262,245 @@
   </div>
 
   <script>
-    /***********************
-     *  Data & opslag
-     ***********************/
-    const REGISTRY_KEY = 'kanban_bordje__registry';
-    const AUTOSAVE_KEY = 'kanban_bordje__autosave';
+    
 
-    const defaultState = () => ({
-      meta: {
-        boardName: null,
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-        sortMode: 'manual',
-        wip: { todo: Infinity, progress: 3, onhold: 2, done: Infinity }
-      },
-      columns: {
-        todo: [],
-        progress: [],
-        onhold: [],
-        done: []
-      }
+/***********************
+ *  Data & opslag
+ ***********************/
+// v2 registry: bewaart ook de 'mooie' naam + metadata, zodat je altijd terugvindt wat je hebt opgeslagen.
+const REGISTRY_KEY_V2 = 'kanban_bordje__registry_v2';
+const REGISTRY_KEY_V1 = 'kanban_bordje__registry';        // legacy (oude versies)
+const AUTOSAVE_KEY    = 'kanban_bordje__autosave';
+
+const defaultState = () => ({
+  meta: {
+    boardName: null,   // displaynaam
+    boardKey: null,    // localStorage key
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    sortMode: 'manual',
+    wip: { todo: Infinity, progress: 3, onhold: 2, done: Infinity }
+  },
+  columns: {
+    todo: [],
+    progress: [],
+    onhold: [],
+    done: []
+  }
+});
+
+let state = loadAutosave() || defaultState();
+let editingCardId = null;
+let dragContext = { fromCol: null, cardId: null };
+
+function uid(){ return 'id-' + Math.random().toString(36).slice(2,9) + '-' + Date.now().toString(36); }
+
+// --- Registry helpers (v2) ---
+function slugify(str){
+  return String(str || '')
+    .trim()
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g,'')         // accents weg
+    .replace(/[^a-z0-9]+/g,'-')             // alles -> -
+    .replace(/^-+|-+$/g,'')                 // trim -
+    .slice(0, 60) || 'mijn-kanban';
+}
+function nameToKey(name){ return `kanban_bordje__board__${slugify(name)}`; }
+
+function readRegistryV2(){
+  try{ return JSON.parse(localStorage.getItem(REGISTRY_KEY_V2) || '[]'); }
+  catch{ return []; }
+}
+function writeRegistryV2(list){
+  localStorage.setItem(REGISTRY_KEY_V2, JSON.stringify(list));
+}
+function upsertRegistryEntry(entry){
+  const list = readRegistryV2();
+  const i = list.findIndex(x => x.key === entry.key);
+  if (i === -1) list.push(entry);
+  else list[i] = { ...list[i], ...entry };
+  // sort: laatst gewijzigd eerst
+  list.sort((a,b)=>(b.updatedAt||0)-(a.updatedAt||0));
+  writeRegistryV2(list);
+}
+function removeRegistryEntry(key){
+  const list = readRegistryV2().filter(x => x.key !== key);
+  writeRegistryV2(list);
+}
+
+// Migratie: als er nog een oude registry bestaat, neem 'm eenmalig over naar v2
+function migrateRegistryIfNeeded(){
+  const v2 = readRegistryV2();
+  if (v2.length) return; // al gemigreerd
+  const v1 = JSON.parse(localStorage.getItem(REGISTRY_KEY_V1) || '[]');
+  if (!v1.length) return;
+
+  const migrated = [];
+  v1.forEach(key=>{
+    try{
+      const raw = localStorage.getItem(key);
+      if (!raw) return;
+      const st = JSON.parse(raw);
+      const name = (st?.meta?.boardName) || key.replace(/^kanban_bordje__/, '');
+      migrated.push({
+        key,
+        name,
+        createdAt: st?.meta?.createdAt || Date.now(),
+        updatedAt: st?.meta?.updatedAt || Date.now(),
+        cards: countCards(st)
+      });
+    }catch{}
+  });
+  if (migrated.length){
+    migrated.sort((a,b)=>(b.updatedAt||0)-(a.updatedAt||0));
+    writeRegistryV2(migrated);
+  }
+}
+
+function countCards(st){
+  try{
+    const cols = st?.columns || {};
+    return ['todo','progress','onhold','done'].reduce((sum,k)=>sum + ((cols[k]||[]).length), 0);
+  }catch{ return 0; }
+}
+
+// --- Save / open ---
+function saveToKey(key, displayName){
+  state.meta.updatedAt = Date.now();
+  state.meta.boardKey  = key;
+  state.meta.boardName = displayName || state.meta.boardName || key;
+
+  localStorage.setItem(key, JSON.stringify(state));
+
+  // Altijd ook autosave
+  localStorage.setItem(AUTOSAVE_KEY, JSON.stringify(state));
+
+  // Registry bijwerken zodat "Openen…" altijd iets zinvols toont
+  upsertRegistryEntry({
+    key,
+    name: state.meta.boardName,
+    createdAt: state.meta.createdAt,
+    updatedAt: state.meta.updatedAt,
+    cards: countCards(state)
+  });
+
+  updateBoardNameBadge();
+}
+
+function save(){
+  if (!state.meta.boardKey || !state.meta.boardName){ return saveAs(); }
+  saveToKey(state.meta.boardKey, state.meta.boardName);
+  toast('Opgeslagen.');
+}
+
+function saveAs(){
+  const name = prompt('Naam voor dit board?', state.meta.boardName || 'mijn-kanban');
+  if (!name) return;
+  const key = nameToKey(name);
+  saveToKey(key, name.trim());
+  toast(`Opgeslagen als “${name.trim()}”.`);
+}
+
+function loadAutosave(){
+  try{ const raw = localStorage.getItem(AUTOSAVE_KEY); return raw? JSON.parse(raw) : null; }
+  catch{ return null; }
+}
+
+function openDialog(){
+  migrateRegistryIfNeeded();
+
+  const wrap = document.getElementById('openList');
+  wrap.innerHTML = '';
+
+  const items = readRegistryV2();
+
+  if (!items.length){
+    wrap.innerHTML = '<p style="color:var(--muted); margin:0;">Nog geen opgeslagen kanbans.</p>';
+  } else {
+    items.forEach(item => {
+      const row = document.createElement('div');
+      row.className = 'row';
+      row.style.justifyContent = 'space-between';
+
+      const when = item.updatedAt ? new Date(item.updatedAt).toLocaleString() : '—';
+      const cards = Number.isFinite(item.cards) ? item.cards : '—';
+
+      row.innerHTML = `
+        <div style="display:flex; flex-direction:column; gap:2px;">
+          <strong>${escapeHtml(item.name || '(naamloos)')}</strong>
+          <span style="color:var(--muted); font-size:12px;">Laatst gewijzigd: ${when} · Kaartjes: ${cards}</span>
+        </div>
+        <span>
+          <button class="btn" data-open="${escapeAttr(item.key)}">Openen</button>
+          <button class="btn danger" data-del="${escapeAttr(item.key)}">Verwijderen</button>
+        </span>`;
+      wrap.appendChild(row);
     });
+  }
 
-    let state = loadAutosave() || defaultState();
-    let editingCardId = null;
-    let dragContext = { fromCol: null, cardId: null };
+  showModal('openModal', true);
 
-    function uid(){ return 'id-' + Math.random().toString(36).slice(2,9) + '-' + Date.now().toString(36); }
+  // Zorg dat we niet stapelen met listeners
+  wrap.removeEventListener('click', onOpenListClick);
+  wrap.addEventListener('click', onOpenListClick);
+}
 
-    function saveToKey(key){
-      state.meta.updatedAt = Date.now();
-      localStorage.setItem(key, JSON.stringify(state));
-      if (key !== AUTOSAVE_KEY){
-        const reg = new Set(JSON.parse(localStorage.getItem(REGISTRY_KEY) || '[]'));
-        reg.add(key);
-        localStorage.setItem(REGISTRY_KEY, JSON.stringify([...reg]));
-        state.meta.boardName = keyToName(key);
-      }
-      // Altijd ook autosaven
+function onOpenListClick(e){
+  const t = e.target;
+  const openKey = t.getAttribute('data-open');
+  const delKey  = t.getAttribute('data-del');
+
+  if (openKey){
+    try{
+      const raw = localStorage.getItem(openKey);
+      if (!raw) return;
+      state = JSON.parse(raw);
+
+      // Veiligheidsnet: meta velden aanvullen
+      state.meta = state.meta || {};
+      state.meta.boardKey  = openKey;
+      state.meta.boardName = state.meta.boardName || (readRegistryV2().find(x=>x.key===openKey)?.name) || '(naamloos)';
+
       localStorage.setItem(AUTOSAVE_KEY, JSON.stringify(state));
       updateBoardNameBadge();
+      renderAll();
+      toast(`Geopend: “${state.meta.boardName}”.`);
+    } catch(err){
+      alert('Fout bij openen: ' + err.message);
+    } finally {
+      showModal('openModal', false);
+      document.getElementById('openList').removeEventListener('click', onOpenListClick);
     }
-    function save(){
-      if (!state.meta.boardName){ return saveAs(); }
-      saveToKey(nameToKey(state.meta.boardName));
-      toast('Opgeslagen.');
-    }
-    function saveAs(){
-      const name = prompt('Naam voor dit board?', state.meta.boardName || 'mijn-kanban');
-      if (!name) return;
-      saveToKey(nameToKey(name));
-      toast(`Opgeslagen als “${name}”.`);
-    }
-    function loadAutosave(){
-      try{ const raw = localStorage.getItem(AUTOSAVE_KEY); return raw? JSON.parse(raw) : null; }
-      catch{ return null; }
-    }
-    function nameToKey(name){ return `kanban_bordje__${name.trim().toLowerCase()}`; }
-    function keyToName(key){ return key.replace(/^kanban_bordje__/, ''); }
+  }
 
-    function openDialog(){
-      const wrap = document.getElementById('openList');
-      wrap.innerHTML = '';
-      const items = JSON.parse(localStorage.getItem(REGISTRY_KEY) || '[]');
-      if (!items.length){
-        wrap.innerHTML = '<p class="muted">Nog geen opgeslagen kanbans.</p>';
-      } else {
-        items.forEach(key => {
-          const name = keyToName(key);
-          const row = document.createElement('div');
-          row.className = 'row';
-          row.style.justifyContent = 'space-between';
-          row.innerHTML = `<strong>${name}</strong>
-            <span>
-              <button class="btn" data-open="${key}">Openen</button>
-              <button class="btn danger" data-del="${key}">Verwijderen</button>
-            </span>`;
-          wrap.appendChild(row);
-        });
-      }
-      showModal('openModal', true);
-
-      wrap.addEventListener('click', onOpenListClick);
+  if (delKey){
+    const name = (readRegistryV2().find(x=>x.key===delKey)?.name) || delKey;
+    if (confirm(`Verwijder opgeslagen board “${name}”?`)){
+      localStorage.removeItem(delKey);
+      removeRegistryEntry(delKey);
+      openDialog(); // herlaad lijst
     }
-    function onOpenListClick(e){
-      const openKey = e.target.getAttribute('data-open');
-      const delKey  = e.target.getAttribute('data-del');
-      if (openKey){
-        try{
-          const raw = localStorage.getItem(openKey);
-          if (!raw) return;
-          state = JSON.parse(raw);
-          localStorage.setItem(AUTOSAVE_KEY, JSON.stringify(state));
-          updateBoardNameBadge();
-          renderAll();
-          toast(`Geopend: “${keyToName(openKey)}”.`);
-        } catch(err){
-          alert('Fout bij openen: ' + err.message);
-        } finally {
-          showModal('openModal', false);
-          document.getElementById('openList').removeEventListener('click', onOpenListClick);
-        }
-      }
-      if (delKey){
-        if (confirm(`Verwijder opgeslagen board “${keyToName(delKey)}”?`)){
-          localStorage.removeItem(delKey);
-          const items = new Set(JSON.parse(localStorage.getItem(REGISTRY_KEY) || '[]'));
-          items.delete(delKey);
-          localStorage.setItem(REGISTRY_KEY, JSON.stringify([...items]));
-          openDialog(); // herlaad lijst
-        }
-      }
-    }
+  }
+}
 
-    function updateBoardNameBadge(){
-      document.getElementById('boardNameLabel').textContent = state.meta.boardName || '[niet opgeslagen]';
-      document.getElementById('sortSelect').value = state.meta.sortMode || 'manual';
-      // WIP waarden tonen
-      for (const col of ['todo','progress','onhold','done']){
-        const v = state.meta.wip[col];
-        document.querySelector(`.wip-val[data-col="${col}"]`).textContent = Number.isFinite(v) ? v : '∞';
-      }
-    }
+function updateBoardNameBadge(){
+  document.getElementById('boardNameLabel').textContent = state.meta.boardName || '[niet opgeslagen]';
+  document.getElementById('sortSelect').value = state.meta.sortMode || 'manual';
+  // WIP waarden tonen
+  for (const col of ['todo','progress','onhold','done']){
+    const v = state.meta.wip[col];
+    document.querySelector(`.wip-val[data-col="${col}"]`).textContent = Number.isFinite(v) ? v : '∞';
+  }
+}
 
-    /***********************
+// HTML escaping voor veilige innerHTML (namen / keys)
+function escapeHtml(s){
+  return String(s).replace(/[&<>"']/g, c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+}
+function escapeAttr(s){ return escapeHtml(s).replace(/`/g,'&#96;'); }
+
+/***********************
      *  Rendering
      ***********************/
     const zones = {
